@@ -1,0 +1,19 @@
+[project]
+name = "simple-grpo"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.12"
+dependencies = [
+    "accelerate>=1.6.0",
+    "einops>=0.8.1",
+    "notebook>=7.4.1",
+    "torch>=2.7.0",
+    "transformers>=4.51.3",
+    "vllm>=0.2.5",
+]
+
+[dependency-groups]
+dev = [
+    "ipython>=9.2.0",
+    "jupyter>=1.1.1",
+]
