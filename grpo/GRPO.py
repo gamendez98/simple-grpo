@@ -35,7 +35,7 @@ class GRPOTrainableModelInterface(Protocol):
 @dataclass
 class ToolGRPOTrainerConfig:
     group_size: int = 4
-    batch_size: int = 8
+    batch_size: int = 4
     minibatch_size: int = 1
     call_reward: float = 0
     numbers_range: tuple[int, int] = (10, 100)
@@ -198,7 +198,7 @@ class ToolGRPOTrainer:
             model = self.old_model if use_old_model else self.model
             output = model.generate(
                 model_inputs,
-                max_length=500,
+                max_length=256,
                 stopping_criteria=StoppingCriteriaList([function_criteria])
             )
             tokens_generated = output.shape[1] - model_inputs.shape[1]
@@ -270,7 +270,6 @@ class ToolGRPOTrainer:
         old_log_probs = torch.gather(old_log_probs, dim=sequence_dim, index=batch_group_generation_unsqueezed)
         old_log_probs = rearrange(old_log_probs, 'batch group sequence 1 -> batch group sequence')
 
-        # TODO: this shit is zero if model and old_model are the same
         new_old_prob_ratio = torch.exp(log_probs - old_log_probs)
         if self.config.objective_clip_band is not None:
             unclipped_objective = new_old_prob_ratio * advantages
