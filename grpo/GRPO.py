@@ -198,7 +198,7 @@ class ToolGRPOTrainer:
             model = self.old_model if use_old_model else self.model
             output = model.generate(
                 model_inputs,
-                max_length=256,
+                max_length=128,
                 stopping_criteria=StoppingCriteriaList([function_criteria])
             )
             tokens_generated = output.shape[1] - model_inputs.shape[1]
@@ -367,9 +367,13 @@ class ToolGRPOTrainer:
             generation, function_calls, _ = self.generate(tokenized_prompt.input_ids)
             generation_text = self.tokenizer.decode(generation[0])
             answer = self.get_answer(generation_text)
-            accumulated_score += self.reward_function(generation_text, inputs, function_calls)
+            current_score = self.reward_function(generation_text, inputs, function_calls)
+            accumulated_score += current_score
             if str(self.tool_multiply(*inputs)) == answer:
                 correct_predictions += 1
+            if current_score > 0:
+                print(f"Prompt: {inputs}")
+                print(f"Answer: {generation_text}")
         print(f"Sample Generation: {generation_text}")
         print(f"Accuracy: {correct_predictions / len(number_inputs)}")
         print(f"Average Reward: {accumulated_score / len(number_inputs)}")
