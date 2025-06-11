@@ -2,8 +2,9 @@ import copy
 import random
 import re
 from dataclasses import dataclass
-from typing import Protocol, Generator
+from typing import Protocol, Generator, Counter
 
+import numpy as np
 import torch
 from einops import rearrange, reduce
 from torch import nn
@@ -18,6 +19,29 @@ from grpo.shorthand_operations import pad_and_concat
 
 ANSWER_REGEX = r'<answer>(.+?)</answer>'
 
+
+def calculate_entropy(arr):
+    """Calculate the Shannon entropy of an array."""
+    # Convert the array to a NumPy array
+    arr = np.array(arr)
+
+    # Get the unique elements and their counts
+    values, counts = np.unique(arr, return_counts=True)
+
+    # Compute the probabilities
+    probabilities = counts / counts.sum()
+
+    # Compute entropy: sum(-p * log2(p))
+    entropy = -np.sum(probabilities * np.log2(probabilities))
+
+    return entropy
+
+def most_common_element_index(arr):
+    arr = np.asarray(arr)
+    counts = Counter(arr)
+    most_common_element, _ = counts.most_common(1)[0]
+    first_index = np.where(arr == most_common_element)[0][0]
+    return first_index
 
 class GRPOTrainableModelInterface(Protocol):
     def parameters(self) -> Generator[nn.Parameter, None, None]: ...
@@ -35,13 +59,13 @@ class GRPOTrainableModelInterface(Protocol):
 @dataclass
 class ToolGRPOTrainerConfig:
     group_size: int = 4
-    batch_size: int = 8
+    batch_size: int = 4
     minibatch_size: int = 1
-    call_reward: float = 0
     numbers_range: tuple[int, int] = (10, 100)
+    call_reward: float = 0
     successful_call_reward: float = 0
     output_format_reward: float = 1
-    correctness_reward: float = 2
+    correctness_reward: float = 10
     dkl_weight: float = 0.01
     gradient_clipping: float = 0.1
     policy_lr: float = 5e-6
@@ -50,10 +74,13 @@ class ToolGRPOTrainerConfig:
     use_divergence_kl: bool = False
     adam_betas: tuple[float, float] = (0.9, 0.99)
     adam_weight_decay: float = 0.1
-    epochs_per_step: int = 1
+    epochs_per_step: int = 4
     objective_clip_band: float = 0.2
     drgrpo: bool = True
     advantage_std_epsilon: float = 1e-8
+    generation_max_tokens: int = 128
+    min_group_entropy: float = 0.5
+    entropy_retries = 20
 
 
 class ToolGRPOTrainer:
@@ -123,7 +150,7 @@ class ToolGRPOTrainer:
         return advantage
 
     def produce_groups(self, number_inputs: list[tuple[int, int]]) -> tuple[
-        torch.Tensor, torch.Tensor, torch.Tensor]:
+        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Produces groups of generated sequences, their corresponding masks, and
         reward values based on a list of input tuples. This function performs
@@ -149,18 +176,33 @@ class ToolGRPOTrainer:
         batch_group_generations = []
         batch_group_generation_masks = []
         batch_group_rewards = []
+        batch_group_reward_entropy = []
         for prompt, n_input in zip(prompts, number_inputs):
             group_generations = []
             group_generation_masks = []
             group_rewards = []
-            for i in range(self.config.group_size):
+            group_reward_entropy = 0.0
+            attempt = 0
+            while len(group_generations) < self.config.group_size or group_reward_entropy < self.config.min_group_entropy:
                 tokenized_prompt = self.tokenizer(prompt, return_tensors='pt').to(self.model.device)
                 generation, function_calls, generation_mask = self.generate(tokenized_prompt["input_ids"], use_old_model=True)
                 generation_text = self.tokenizer.decode(generation[0])
                 reward = self.reward_function(generation_text, n_input, function_calls)
-                group_generations.append(generation)
-                group_generation_masks.append(generation_mask)
-                group_rewards.append(reward)
+                if len(group_generations) == self.config.group_size:
+                    index_to_replace = most_common_element_index(group_rewards)
+                    group_generations[index_to_replace] = generation
+                    group_generation_masks[index_to_replace] = generation_mask
+                    group_rewards[index_to_replace] = reward
+                    print(f'replacement due to low entropy attempt {attempt}!!!!')
+                    attempt += 1
+                    if attempt > self.config.entropy_retries:
+                        break
+                else:
+                    group_generations.append(generation)
+                    group_generation_masks.append(generation_mask)
+                    group_rewards.append(reward)
+                group_reward_entropy = calculate_entropy(group_rewards)
+            batch_group_reward_entropy.append(group_reward_entropy)
             # shape (group, sequence)
             group_generations = pad_and_concat(group_generations)
             # shape (group, sequence)
@@ -181,7 +223,8 @@ class ToolGRPOTrainer:
         # (batch, group)
         batch_group_rewards = [rearrange(gr, 'group -> 1 group') for gr in batch_group_rewards]
         batch_group_rewards = pad_and_concat(batch_group_rewards)
-        return batch_group_generations, batch_group_generation_masks, batch_group_rewards
+        batch_group_reward_entropy = torch.tensor(batch_group_reward_entropy, dtype=torch.float32)
+        return batch_group_generations, batch_group_generation_masks, batch_group_rewards, batch_group_reward_entropy
 
     @torch.inference_mode()
     def generate(self, tokenized_prompt: torch.Tensor, use_old_model: bool = False) -> tuple[torch.Tensor, list[FunctionCall], torch.Tensor]:
@@ -198,7 +241,7 @@ class ToolGRPOTrainer:
             model = self.old_model if use_old_model else self.model
             output = model.generate(
                 model_inputs,
-                max_length=500,
+                max_length=self.config.generation_max_tokens,
                 stopping_criteria=StoppingCriteriaList([function_criteria])
             )
             tokens_generated = output.shape[1] - model_inputs.shape[1]
@@ -229,7 +272,7 @@ class ToolGRPOTrainer:
     def reward_function(self, generation_text: str, number_inputs: tuple[int, int], function_calls: list[FunctionCall]):
         total_reward = 0
         answer = self.get_answer(generation_text)
-        if answer is not None:
+        if answer is not None and answer.isnumeric():
             total_reward += self.config.output_format_reward
         if str(self.tool_multiply(*number_inputs)) == answer:
             total_reward += self.config.correctness_reward
@@ -270,7 +313,6 @@ class ToolGRPOTrainer:
         old_log_probs = torch.gather(old_log_probs, dim=sequence_dim, index=batch_group_generation_unsqueezed)
         old_log_probs = rearrange(old_log_probs, 'batch group sequence 1 -> batch group sequence')
 
-        # TODO: this shit is zero if model and old_model are the same
         new_old_prob_ratio = torch.exp(log_probs - old_log_probs)
         if self.config.objective_clip_band is not None:
             unclipped_objective = new_old_prob_ratio * advantages
@@ -316,7 +358,13 @@ class ToolGRPOTrainer:
                 batch_group_generations,
                 batch_group_generation_masks,
                 batch_group_rewards,
+                batch_group_reward_entropy,
             ) = self.produce_groups(number_inputs)
+
+            print(f"Average reward: {batch_group_rewards.mean()}; batch_group_reward_entropy: {batch_group_reward_entropy}")
+            if batch_group_reward_entropy.sum() < self.config.min_group_entropy:
+                print("Skipping due to low entropy.")
+                continue
 
             for epoch in range(self.config.epochs_per_step):
                 index_permutation = torch.randperm(batch_group_generations.shape[batch_dim])
@@ -331,7 +379,9 @@ class ToolGRPOTrainer:
                     minibatch_group_generation_masks = batch_group_generation_masks[mini_batch_index, :, :].to(device)
                     minibatch_group_rewards = batch_group_rewards[mini_batch_index, :].to(device)
 
-                    loss = -self.objective_function(
+                    # This should be `-objective_function` but for some reason that makes the model not learn(?) there is
+                    # some random minus flipping the `objective_function` somewhere
+                    loss = self.objective_function(
                         minibatch_group_generations,
                         minibatch_group_generation_masks,
                         minibatch_group_rewards,
