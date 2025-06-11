@@ -91,7 +91,6 @@ class ToolGRPOTrainer:
             config: ToolGRPOTrainerConfig = None,
     ):
         self.config = config or ToolGRPOTrainerConfig()
-        self.grad_clipping = 0.1
 
         self.rl_steps = self.config.max_steps // self.config.group_size
         self.optimizer = torch.optim.AdamW(
@@ -390,7 +389,7 @@ class ToolGRPOTrainer:
                     self.optimizer.zero_grad(set_to_none=True)
                     loss.backward()
                     nn.utils.clip_grad_norm_(
-                        self.model.parameters(), self.grad_clipping
+                        self.model.parameters(), self.config.gradient_clipping
                     )
                     self.optimizer.step()
 
