@@ -1,10 +1,14 @@
 # %%
-from typing import Any
+import json
+import os
+from itertools import batched
+from pathlib import Path
+from typing import Any, Generator
 
-import pandas as pd
-from transformers import AutoTokenizer
-import torch
 import einops
+import pandas as pd
+import torch
+from transformers import AutoTokenizer
 
 # %%%
 test_conversations = [
@@ -135,17 +139,32 @@ test_conversations = [
 ConversationType = list[list[dict[str, Any]]]
 
 
+def load_json(file_path: Path) -> dict[str, Any]:
+    with open(file_path) as f:
+        return json.load(f)
+
+
 # %%
 
 class MilestoneDataLoader:
 
-    def __init__(self, model_name: str = "Qwen/Qwen2.5-0.5B-Instruct", message_start_token: str = "<|im_start|>"):
+    def __init__(
+            self,
+            path: Path,
+            expected_file_name='annotated_conversation.json',
+            batch_size: int = 4,
+            model_name: str = 'Qwen/Qwen2.5-0.5B-Instruct',
+            message_start_token: str = '<|im_start|>'
+    ):
+        self.batch_size = batch_size
+        self.path = path
+        self.expected_file_name = expected_file_name
         self.message_start_token = message_start_token
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.message_start_token_id = self.tokenizer.convert_tokens_to_ids(self.message_start_token)
 
-
-    def prepare_annotated_conversations(self, annotated_conversations: ConversationType) -> tuple[torch.Tensor, torch.Tensor]:
+    def prepare_annotated_conversations(self, annotated_conversations: tuple[ConversationType]) -> tuple[
+        torch.Tensor, torch.Tensor]:
         conversation_scores = []
         texts = self.tokenizer.apply_chat_template(
             annotated_conversations,
@@ -154,7 +173,7 @@ class MilestoneDataLoader:
         tokens = self.tokenizer(
             texts,
             return_offsets_mapping=True,
-            return_tensors="pt",  # <- this makes it return PyTorch tensors
+            return_tensors='pt',  # <- this makes it return PyTorch tensors
             padding=True,  # optional
             truncation=True  # optional
         )
@@ -163,28 +182,54 @@ class MilestoneDataLoader:
             # noinspection PyTypeChecker
             message_start_indices = einops.rearrange(
                 torch.nonzero(tokens['input_ids'][index] == self.message_start_token_id, as_tuple=False),
-                "m 1 -> m"
+                'm 1 -> m'
             )
             message_roles = [messages.get('role') for messages in annotated_conversations[index]]
-            message_scores = [message.get('milestone_gain', 0) for message in test_conversations[0]]
+            message_scores = [message.get('milestone_gain', 0) for message in annotated_conversations[index]]
             clean_scores = [s * (r == 'assistant') for s, r in zip(message_scores, message_roles)]
             clean_scores += [0]
             message_lengths = [i for i in torch.diff(message_start_indices, dim=0).tolist()]
             message_lengths += [tensor_size - message_start_indices[-1]]
-            conversation_scores.append(sum(
-                (([cs] * ml) for cs, ml in zip(clean_scores, message_lengths)),
-                start=[]
-            ))
+            extended_clean_scores = []
+            for cs, ml in zip(clean_scores, message_lengths):
+                extended_clean_scores += [0, 0, 0] + [cs] * (ml-5) + [0, 0] # The 0 padding is for eliminating the prompt conversation formating
+            conversation_scores.append(extended_clean_scores)
+            df = pd.DataFrame({
+                'token_ids': tokens['input_ids'][index].tolist(),
+                'conversation': self.tokenizer.convert_ids_to_tokens(tokens['input_ids'][index]),
+                'conversation_score': conversation_scores[-1]
+            })
+            print(df)
 
-        return tokens, torch.tensor(conversation_scores)
+        return tokens, torch.tensor(conversation_scores) * tokens['attention_mask']
+
+    def file_generator(self, entry_path: Path = None) -> Generator[Path, None, None]:
+        """
+        Recursively yields paths of files in `root_path` (and subdirectories)
+        that have the given `target_name`.
+        """
+        entry_path = entry_path or self.path
+        for entry in os.scandir(entry_path):
+            if entry.is_file() and entry.name == self.expected_file_name:
+                yield Path(entry.path)
+            elif entry.is_dir():
+                yield from self.file_generator(Path(entry.path))
+
+    def batch_generator(self) -> Generator[tuple[torch.Tensor, torch.Tensor], None, None]:
+        for annotated_chat_batch in batched(map(load_json, self.file_generator()), self.batch_size):
+            tokens, conversation_scores = self.prepare_annotated_conversations(annotated_chat_batch)
+            yield tokens, conversation_scores
 
 
 def main():
-    mdl = MilestoneDataLoader()
-    T, A = mdl.prepare_annotated_conversations(test_conversations)
-    tt = mdl.tokenizer.convert_ids_to_tokens(T['input_ids'][1])
-    df = pd.DataFrame({'t_ids': T['input_ids'][1].tolist(), 'tokens': tt, 'rewards': A[1].tolist()})
-    print(T.shape, A.shape)
+    mdl = MilestoneDataLoader(path=Path('data'))
+
+    for i, batch in zip(range(4), mdl.batch_generator()):
+        df = pd.DataFrame({
+            'input_ids': batch[0]['input_ids'][0].tolist(),
+            'conversation_scores': batch[1].tolist()
+        })
+        print(df)
 
 
 if __name__ == "__main__":
