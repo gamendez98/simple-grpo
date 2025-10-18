@@ -6,7 +6,6 @@ from pathlib import Path
 from typing import Any, Generator
 
 import einops
-import pandas as pd
 import torch
 from transformers import AutoTokenizer
 
@@ -162,6 +161,7 @@ class MilestoneDataLoader:
         self.message_start_token = message_start_token
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.message_start_token_id = self.tokenizer.convert_tokens_to_ids(self.message_start_token)
+        self.length = None
 
     def prepare_annotated_conversations(self, annotated_conversations: tuple[ConversationType]) -> tuple[
         torch.Tensor, torch.Tensor]:
@@ -172,7 +172,6 @@ class MilestoneDataLoader:
         )
         tokens = self.tokenizer(
             texts,
-            return_offsets_mapping=True,
             return_tensors='pt',  # <- this makes it return PyTorch tensors
             padding=True,  # optional
             truncation=True  # optional
@@ -194,12 +193,6 @@ class MilestoneDataLoader:
             for cs, ml in zip(clean_scores, message_lengths):
                 extended_clean_scores += [0, 0, 0] + [cs] * (ml-5) + [0, 0] # The 0 padding is for eliminating the prompt conversation formating
             conversation_scores.append(extended_clean_scores)
-            df = pd.DataFrame({
-                'token_ids': tokens['input_ids'][index].tolist(),
-                'conversation': self.tokenizer.convert_ids_to_tokens(tokens['input_ids'][index]),
-                'conversation_score': conversation_scores[-1]
-            })
-            print(df)
 
         return tokens, torch.tensor(conversation_scores) * tokens['attention_mask']
 
@@ -215,6 +208,12 @@ class MilestoneDataLoader:
             elif entry.is_dir():
                 yield from self.file_generator(Path(entry.path))
 
+    def __len__(self):
+        if self.length is None:
+            self.length = sum(1 for _ in self.file_generator())
+        return self.length
+
+
     def batch_generator(self) -> Generator[tuple[torch.Tensor, torch.Tensor], None, None]:
         for annotated_chat_batch in batched(map(load_json, self.file_generator()), self.batch_size):
             tokens, conversation_scores = self.prepare_annotated_conversations(annotated_chat_batch)
@@ -222,6 +221,7 @@ class MilestoneDataLoader:
 
 
 def main():
+    import pandas as pd
     mdl = MilestoneDataLoader(path=Path('data'))
 
     for i, batch in zip(range(4), mdl.batch_generator()):
