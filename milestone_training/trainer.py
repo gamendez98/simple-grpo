@@ -49,7 +49,7 @@ class SimpleMilestoneTrainer:
         input_ids = einops.rearrange(input_ids, 'b t -> b t 1')
         token_log_probs = log_probs.gather(dim=-1, index=input_ids)
         token_log_probs = einops.rearrange(token_log_probs, 'b t 1 -> b t')
-        loss = -torch.mean(token_log_probs * conversation_scores)
+        loss = -torch.mean(token_log_probs * einops.rearrange(conversation_scores, "b t 1 -> b t"))
         return loss
 
     def train(self):
