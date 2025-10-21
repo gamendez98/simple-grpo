@@ -44,6 +44,14 @@ class SimpleMilestoneTrainer:
             num_training_steps=num_training_steps
         )
 
+    def calculate_loss(self, input_ids: torch.Tensor, logits: torch.Tensor, conversation_scores: torch.Tensor):
+        log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+        input_ids = einops.rearrange(input_ids, 'b t -> b t 1')
+        token_log_probs = log_probs.gather(dim=-1, index=input_ids)
+        token_log_probs = einops.rearrange(token_log_probs, 'b t 1 -> b t')
+        loss = -torch.mean(token_log_probs * conversation_scores)
+        return loss
+
     def train(self):
         self.model.train()
         for i in range(self.config.epochs):
@@ -52,7 +60,7 @@ class SimpleMilestoneTrainer:
                 conversation_scores = einops.rearrange(conversation_scores, 'b t -> b t 1')
                 tokens = tokens.to(self.model.device)
                 logits = self.model(**tokens).logits
-                loss = - (logits * conversation_scores).sum()
+                loss = self.calculate_loss(tokens.input_ids, logits, conversation_scores)
                 loss.backward()
 
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
