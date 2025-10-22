@@ -18,6 +18,12 @@ def load_json(file_path: Path) -> dict[str, Any]:
         return json.load(f)
 
 
+def has_non_zero_milestone_gain(json_entr: dict) -> bool:
+    for message in json_entr:
+        if message.get('milestone_gain', 0) > 0:
+            return True
+    return False
+
 # %%
 
 class MilestoneDataLoader:
@@ -66,7 +72,7 @@ class MilestoneDataLoader:
             message_lengths += [tensor_size - message_start_indices[-1]]
             extended_clean_scores = []
             for cs, ml in zip(clean_scores, message_lengths):
-                extended_clean_scores += [0, 0, 0] + [cs] * (ml-5) + [0, 0] # The 0 padding is for eliminating the prompt conversation formating
+                extended_clean_scores += [0, 0, 0] + [cs] * (ml-4) + [0] # The 0 padding is for eliminating the prompt conversation formating
             conversation_scores.append(extended_clean_scores)
 
         return tokens, torch.tensor(conversation_scores) * tokens['attention_mask']
@@ -90,7 +96,10 @@ class MilestoneDataLoader:
 
 
     def batch_generator(self) -> Generator[tuple[torch.Tensor, torch.Tensor], None, None]:
-        for annotated_chat_batch in batched(map(load_json, self.file_generator()), self.batch_size):
+        json_generator = map(load_json, self.file_generator())
+        filtered_json_generator = filter(has_non_zero_milestone_gain, json_generator)
+        batched_json_generator = batched(filtered_json_generator, self.batch_size)
+        for annotated_chat_batch in batched_json_generator:
             tokens, conversation_scores = self.prepare_annotated_conversations(annotated_chat_batch)
             yield tokens, conversation_scores
 

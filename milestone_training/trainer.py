@@ -15,7 +15,7 @@ class SimpleMilestoneTrainerConfig:
     policy_lr: float = 1e-4
     adam_betas: tuple[float, float] = (0.9, 0.999)
     adam_weight_decay: float = 0.01
-    gradient_clipping: float = 0.5
+    gradient_clipping: float = 0.1
 
 
 class SimpleMilestoneTrainer:
@@ -24,12 +24,12 @@ class SimpleMilestoneTrainer:
             self,
             model,
             data_loader: MilestoneDataLoader,
-            config=SimpleMilestoneTrainerConfig()
+            config=None
     ):
         self.model = model
         self.data_loader = data_loader
-        self.config = config
-        self.optimizer = self.optimizer = torch.optim.AdamW(
+        self.config = config or SimpleMilestoneTrainerConfig()
+        self.optimizer = torch.optim.AdamW(
             model.parameters(),
             lr=self.config.policy_lr,
             betas=self.config.adam_betas,
@@ -43,35 +43,63 @@ class SimpleMilestoneTrainer:
             num_warmup_steps=num_warmup_steps,
             num_training_steps=num_training_steps
         )
+        self.cross_entropy_loss = torch.nn.CrossEntropyLoss()
 
     def calculate_loss(self, input_ids: torch.Tensor, logits: torch.Tensor, conversation_scores: torch.Tensor):
         log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
         input_ids = einops.rearrange(input_ids, 'b t -> b t 1')
         token_log_probs = log_probs.gather(dim=-1, index=input_ids)
         token_log_probs = einops.rearrange(token_log_probs, 'b t 1 -> b t')
-        loss = -torch.mean(token_log_probs * einops.rearrange(conversation_scores, "b t 1 -> b t"))
+        loss = -torch.sum(token_log_probs * conversation_scores) / conversation_scores.sum()
         return loss
 
     def train(self):
         self.model.train()
         for i in range(self.config.epochs):
-            for tokens, conversation_scores in tqdm(self.data_loader.batch_generator(), total=len(self.data_loader)):
+            for tokens, conversation_scores in tqdm(self.data_loader.batch_generator(), total=len(self.data_loader) // self.data_loader.batch_size):
                 conversation_scores = conversation_scores.to(self.model.device)
-                conversation_scores = einops.rearrange(conversation_scores, 'b t -> b t 1')
                 tokens = tokens.to(self.model.device)
-                logits = self.model(**tokens).logits
-                loss = self.calculate_loss(tokens.input_ids, logits, conversation_scores)
-                loss.backward()
+                input_ids_x = tokens.input_ids[:,:-1]
+                atta_mask_x = tokens.attention_mask[:,:-1]
+                input_ids_y = tokens.input_ids[:, 1:]
+                logits = self.model(input_ids = input_ids_x, attention_mask = atta_mask_x).logits
 
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                self.optimizer.zero_grad()
+                loss = self.calculate_loss(input_ids_y, logits, conversation_scores[:, 1:])
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.gradient_clipping)
                 self.optimizer.step()
                 self.scheduler.step()
-                self.optimizer.zero_grad(set_to_none=True)
 
-            if self.scheduler:
-                self.scheduler.step()
             if i % 10 == 0:
                 self.evaluate()
+
+    def test(self, conversation: list[dict]):
+        model = self.model
+        model.zero_grad(set_to_none=True)
+        torch.cuda.empty_cache()
+        model.eval()
+        tokenizer = self.data_loader.tokenizer
+        text = tokenizer.apply_chat_template(
+            conversation,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        print("=" * 100)
+        print("=" * 100)
+        print(f"```{text}```")
+        print("=" * 50 + "GENERATION" + "=" * 50)
+        model_inputs = tokenizer([text], return_tensors="pt").to(self.model.device)
+        generated_ids = model.generate(
+            **model_inputs,
+            max_new_tokens=300
+        )
+        output_ids = generated_ids[0][len(model_inputs.input_ids[0]):].tolist()
+        output_text = tokenizer.decode(output_ids).strip()
+        print(f"```{output_text}```")
+        print("=" * 100)
+        print("=" * 100)
+        return output_text
 
     def evaluate(self):
         pass
@@ -82,15 +110,31 @@ def main():
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         torch_dtype="auto",
-        device_map="auto"
+        device_map={"":2}
     )
     data_loader = MilestoneDataLoader(
-        path=Path('data'),
+        path=Path('data/full_scenarios_tools'),
         model_name=model_name,
-        batch_size=1
+        batch_size=2
     )
-    smt = SimpleMilestoneTrainer(model=model, data_loader=data_loader)
+    smt = SimpleMilestoneTrainer(
+        model=model,
+        data_loader=data_loader,
+        config=SimpleMilestoneTrainerConfig(epochs=1)
+    )
+    test_messages = [
+        {
+            "role": "system",
+            "content": "Don't make assumptions about what values to plug into functions. Ask for clarification if a user request is ambiguous."
+        },
+        {
+            "role": "user",
+            "content": "What is the address of lattitude: 37.334606, longitude: -122.009102"
+        }
+    ]
+    smt.test(test_messages)
     smt.train()
+    smt.test(test_messages)
 
 
 if __name__ == "__main__":
